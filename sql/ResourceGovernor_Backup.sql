@@ -1,12 +1,16 @@
 -- ResourceGovernor_Backup.sql
 -- Purpose: Configure SQL Server Resource Governor to cap backup jobs and route SQL Agent backup job sessions
--- Author: Converted from provided instructions
--- Notes: Update the job name filter in the INSERT/select section to match your environment.
+-- Author: Naga Diviseema
+-- Notes: Update the @JobNamePattern variable to match your environment.
 
 USE master;
 GO
 
--- Step 1: Capture Backup Jobs into a helper table
+-- Step 0: Configuration
+-- Set this to match your SQL Agent backup job naming convention (uses UPPER comparison)
+DECLARE @JobNamePattern NVARCHAR(256) = '%BACKUP APP%'; -- e.g. '%BACKUP%' or '%DB BACKUP%'
+
+-- Step 1: Capture Backup Jobs into a helper table (idempotent)
 IF OBJECT_ID('dbo.RG_BackgroundJobs', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.RG_BackgroundJobs
@@ -18,21 +22,33 @@ BEGIN
 END
 GO
 
--- Populate the table with SQL Agent jobs whose name matches your backup job naming convention
--- Adjust the LIKE pattern below as needed
-INSERT INTO dbo.RG_BackgroundJobs (job_id, name, match_string)
-SELECT
-    job_id,
-    name,
-    'SQLAgent - TSQL JobStep (Job 0x'
-    + CONVERT(VARCHAR(34), CONVERT(VARBINARY(16), job_id), 1)
-    + '%'
-FROM msdb.dbo.sysjobs
-WHERE UPPER(name) LIKE '%BACKUP APP%'; -- Filter your required jobs here
+-- Use MERGE to insert or update rows for matching jobs (idempotent)
+MERGE dbo.RG_BackgroundJobs AS target
+USING
+(
+    SELECT
+        job_id,
+        name,
+        'SQLAgent - TSQL JobStep (Job 0x'
+        + CONVERT(VARCHAR(34), CONVERT(VARBINARY(16), job_id), 1)
+        + '%'
+        AS match_string
+    FROM msdb.dbo.sysjobs
+    WHERE UPPER(name) LIKE UPPER(@JobNamePattern)
+) AS src (job_id, name, match_string)
+ON (target.job_id = src.job_id)
+WHEN MATCHED AND (target.name <> src.name OR target.match_string <> src.match_string) THEN
+    UPDATE SET name = src.name, match_string = src.match_string
+WHEN NOT MATCHED BY TARGET THEN
+    INSERT (job_id, name, match_string)
+    VALUES (src.job_id, src.name, src.match_string);
+-- Optionally uncomment the following block to remove rows for jobs that no longer exist
+-- WHEN NOT MATCHED BY SOURCE THEN
+--     DELETE
+;
 GO
 
--- Step 2: Create Resource Pool and Workload Group
--- Adjust MIN_CPU_PERCENT, MAX_CPU_PERCENT, CAP_CPU_PERCENT to your requirements
+-- Step 2: Create Resource Pool and Workload Group (if not exists)
 IF NOT EXISTS (SELECT 1 FROM sys.resource_governor_resource_pools WHERE name = 'Pool_Backup')
 BEGIN
     CREATE RESOURCE POOL Pool_Backup
@@ -120,4 +136,4 @@ WHERE s.is_user_process = 1
 ORDER BY s.session_id;
 GO
 
--- Cleanup notes (optional): If you need to remove changes, drop the classifier or workload group/resource pool after verification.
+-- End of script
