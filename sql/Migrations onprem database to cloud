@@ -1,0 +1,160 @@
+# Migrating On-Prem SQL Server to SQL Server on Azure VM Using Backup to URL (Azure Blob Storage)
+
+Migrating your on-premises SQL Server to a SQL Server VM in Azure gives you full control over the SQL Server engine while benefiting from cloud scalability, security, and simplified infrastructure management. The primary method in this guide uses SQL Server's native **BACKUP/RESTORE ... TO/FROM URL** syntax, authenticated with a SQL Server credential created directly from the **storage account** (using the storage account key), so the on-prem instance streams the backup straight to Azure Blob Storage over HTTPS with no local `.bak` file and no intermediate file share.
+
+An alternative that stages backups through an Azure Files (CIFS/SMB) share first is also included further down, for teams that prefer to keep an SMB-based backup workflow.
+
+## Table of Contents
+
+- [Pre-Migration Essentials](#pre-migration-essentials)
+- [Step-by-Step Migration](#step-by-step-migration)
+  - [Step 1: Create the Storage Account and Blob Container](#step-1-create-the-storage-account-and-blob-container)
+  - [Step 2: Create a SQL Server Credential from the Storage Account](#step-2-create-a-sql-server-credential-from-the-storage-account)
+  - [Step 3: Backup SQL Server Database to URL](#step-3-backup-sql-server-database-to-url)
+  - [Step 4: Restore on the Azure VM](#step-4-restore-on-the-azure-vm)
+- [Alternative Approach: Stage Through Azure Files (CIFS)](#alternative-approach-stage-through-azure-files-cifs)
+- [Post-Migration Tasks](#post-migration-tasks)
+- [Summary](#summary)
+
+## Pre-Migration Essentials
+
+### 1. Assess Compatibility
+
+Use Data Migration Assistant (DMA) to:
+
+* Detect breaking changes
+* Identify unsupported features
+* Validate SQL Server version compatibility with your Azure VM target
+
+### 2. Prepare Backups
+
+Ensure:
+
+* Full backups are available
+* Log backups are consistent (if needed)
+* The on-prem SQL Server has outbound HTTPS (port 443) access to `*.blob.core.windows.net` — no SMB/CIFS connectivity is required for this approach
+
+### 3. Prepare Azure VM
+
+Your Azure VM should have:
+
+* SQL Server installed
+* Adequate storage for MDF/LDF files
+* Network access to Azure Storage (HTTPS outbound)
+
+## Step-by-Step Migration
+
+### Step 1: Create the Storage Account and Blob Container
+
+1. In the Azure Portal, create a **Storage Account** (or use an existing one).
+2. Go to **Containers** under Data Storage and select **+ Container**.
+3. Name the container (e.g., `sqlbackups`) and set anonymous access to **Private**.
+4. Go to **Access keys** on the storage account and copy one of the storage account keys — this is what the SQL Server credential will use to authenticate, so keep it secure.
+
+### Step 2: Create a SQL Server Credential from the Storage Account
+
+In SSMS, connect to the on-prem SQL Server instance and create a credential whose **name is the container URL** and whose **identity is the storage account name**, with the storage account key as the secret:
+
+```sql
+CREATE CREDENTIAL [https://<storageaccount>.blob.core.windows.net/sqlbackups]
+WITH IDENTITY = '<storageaccount>',
+SECRET = '<storage_account_access_key>';
+```
+
+Notes:
+* The credential name must exactly match the HTTPS URL of the target container.
+* Using the storage account key (`IDENTITY = '<storageaccount>'`) authenticates at the account level, so this single credential works for any blob written under that account — no SAS expiration to track or regenerate.
+* If you'd rather scope access more tightly and set an expiration, you can instead create the credential with `IDENTITY = 'SHARED ACCESS SIGNATURE'` and a SAS token as the secret. Functionally identical for `BACKUP/RESTORE ... URL`, just narrower and time-bound.
+
+### Step 3: Backup SQL Server Database to URL
+
+```sql
+BACKUP DATABASE [YourDatabase]
+TO URL = 'https://<storageaccount>.blob.core.windows.net/sqlbackups/YourDatabase.bak'
+WITH FORMAT, COMPRESSION, STATS = 10;
+```
+
+SQL Server streams the backup directly to the blob container. Confirm the blob exists in the container via the Azure Portal or Azure Storage Explorer.
+
+### Step 4: Restore on the Azure VM
+
+On the Azure VM, create the matching credential (same storage account key, same container URL):
+
+```sql
+CREATE CREDENTIAL [https://<storageaccount>.blob.core.windows.net/sqlbackups]
+WITH IDENTITY = '<storageaccount>',
+SECRET = '<storage_account_access_key>';
+```
+
+Then restore directly from the URL — no download step required:
+
+```sql
+RESTORE DATABASE [YourDatabase]
+FROM URL = 'https://<storageaccount>.blob.core.windows.net/sqlbackups/YourDatabase.bak'
+WITH MOVE 'YourDatabase_Data' TO 'D:\Data\YourDatabase.mdf',
+     MOVE 'YourDatabase_Log'  TO 'D:\Log\YourDatabase_log.ldf';
+```
+
+Adjust file paths based on your VM's storage layout.
+
+## Alternative Approach: Stage Through Azure Files (CIFS)
+
+If your existing backup tooling or scripts depend on writing to a UNC path rather than calling `BACKUP ... TO URL` directly, you can stage through an Azure Files (CIFS/SMB) share instead, then move the file into Blob Storage.
+
+1. **Create an Azure Files share** (e.g., `sqlbackups-cifs`) in the same storage account.
+2. **Mount it on-prem:**
+   ```cmd
+   net use Z: \\<storageaccount>.file.core.windows.net\sqlbackups-cifs /u:AZURE\<storageaccount> <storage-account-key>
+   ```
+3. **Backup to the mounted share:**
+   ```sql
+   BACKUP DATABASE [YourDatabase]
+   TO DISK = 'Z:\YourDatabase.bak'
+   WITH INIT, FORMAT, COMPRESSION;
+   ```
+4. **Copy from Azure Files to Blob Storage with AzCopy** (server-side, since both live in the same storage account):
+   ```bash
+   azcopy copy "https://<storageaccount>.file.core.windows.net/sqlbackups-cifs/YourDatabase.bak?<SAS_TOKEN>" \
+   "https://<storageaccount>.blob.core.windows.net/sqlbackups/YourDatabase.bak?<SAS_TOKEN>"
+   ```
+5. **Restore on the Azure VM** using the same `RESTORE ... FROM URL` shown in Step 4 above, or download the `.bak` locally first with AzCopy and use `RESTORE ... FROM DISK`.
+
+**When to use which approach:**
+
+| | Backup to URL (primary) | Azure Files (CIFS) staging |
+|---|---|---|
+| Best for | Teams comfortable moving fully to `BACKUP/RESTORE ... URL` | Teams keeping existing SMB backup tooling/scripts |
+| Moving parts | Storage account + Blob container + SQL credential | Storage account + File share + Blob container + AzCopy |
+| Local `.bak` file | No — streamed directly to Blob | Yes, on the mounted share |
+| Extra hop | None | Files → Blob copy |
+| Connectivity needed | HTTPS only | SMB (445) + HTTPS |
+
+## Post-Migration Tasks
+
+### 1. Validate
+
+* Application connectivity
+* Stored procedures, triggers, jobs
+* SQL Agent schedules
+* Linked servers and credentials
+
+### 2. Optimize
+
+* TempDB configuration
+* MAXDOP and memory settings
+* Storage performance (Premium SSD vs Ultra Disk)
+* Rotate or scope down the storage account key/SAS used for the backup credential once migration is complete
+
+### 3. Monitor
+
+Use Azure-native tools:
+
+* Azure Monitor
+* Log Analytics
+* SQL Server Error Logs
+* Performance Insights
+* Storage account metrics (transaction/throughput monitoring on the Blob container)
+
+## Summary
+
+This migration pattern — **on-prem SQL Server → `BACKUP TO URL` → Azure Blob Storage → SQL Server on Azure VM** — uses a SQL Server credential created directly from the storage account to stream backups straight into Blob Storage over HTTPS, with no local `.bak` file and no file-share hop. It's the simplest path when you're able to move backup scripts to native `TO URL` syntax, and it works with any SQL Server version that supports `BACKUP/RESTORE ... TO/FROM URL`. The Azure Files (CIFS) staging pattern remains available as a drop-in alternative for teams that need to keep SMB-based backup workflows in place.
