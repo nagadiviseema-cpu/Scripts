@@ -1,9 +1,7 @@
 # Optimized Locking in SQL Server 2025
-
-Scripts and notes for implementing and testing optimized locking in SQL Server 2025.
-# Optimized Locking in SQL Server 2025
-
 ## Preparing a SQL Server 2025 Demo
+Scripts and notes for implementing and testing optimized locking in SQL Server 2025.
+
 
 The following example should be executed only in a development or test environment.
 
